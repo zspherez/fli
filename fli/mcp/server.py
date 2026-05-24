@@ -7,23 +7,11 @@ travel dates.
 
 import json
 import os
-from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
-from fastmcp.tools import Tool as FastMCPTool
-from mcp.types import (
-    GetPromptResult,
-    ListPromptsResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    TextContent,
-    Tool,
-    ToolAnnotations,
-)
+from mcp.types import Icon
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,13 +20,19 @@ from fli.core import (
     build_flight_segments,
     build_time_restrictions,
     parse_airlines,
+    parse_alliances,
     parse_cabin_class,
+    parse_currency,
+    parse_emissions,
     parse_max_stops,
     parse_sort_by,
     resolve_airport,
+    search_airports,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
+    Airport,
+    BagsFilter,
     DateSearchFilters,
     FlightSearchFilters,
     PassengerInfo,
@@ -86,122 +80,15 @@ CONFIG = FlightSearchConfig()
 CONFIG_SCHEMA = FlightSearchConfig.model_json_schema()
 
 
-@dataclass
-class PromptSpec:
-    """Container for prompt metadata and builder."""
-
-    description: str
-    build_messages: Callable[[dict[str, str]], list[PromptMessage]]
-    arguments: list[PromptArgument] | None = None
-
-
-class FliMCP(FastMCP):
-    """Extended FastMCP server with prompt and annotation support."""
-
-    def __init__(self, name: str | None = None, **settings: Any):
-        """Initialize the MCP server with metadata tracking for tools and prompts."""
-        self._tool_annotations: dict[str, ToolAnnotations] = {}
-        self._prompts: dict[str, PromptSpec] = {}
-        super().__init__(name=name, **settings)
-
-    def _setup_handlers(self) -> None:
-        """Register MCP protocol handlers including prompts."""
-        super()._setup_handlers()
-        self._mcp_server.list_tools()(self.list_tools)
-        self._mcp_server.list_prompts()(self.list_prompts)
-        self._mcp_server.get_prompt()(self.get_prompt)
-
-    def add_tool(
-        self,
-        func: Callable,
-        name: str | None = None,
-        description: str | None = None,
-        annotations: dict[str, Any] | ToolAnnotations | None = None,
-    ) -> None:
-        """Register a tool with optional annotations."""
-        tool = FastMCPTool.from_function(fn=func, name=name, description=description)
-        self._tool_manager.add_tool(tool)
-        tool_name = name or func.__name__
-        if annotations:
-            self._tool_annotations[tool_name] = (
-                annotations
-                if isinstance(annotations, ToolAnnotations)
-                else ToolAnnotations(**annotations)
-            )
-
-    def tool(
-        self,
-        name: str | None = None,
-        description: str | None = None,
-        annotations: dict[str, Any] | ToolAnnotations | None = None,
-    ) -> Callable:
-        """Register a tool with optional annotations."""
-        if callable(name):
-            raise TypeError(
-                "The @tool decorator was used incorrectly. "
-                "Did you forget to call it? Use @tool() instead of @tool"
-            )
-
-        def decorator(func: Callable) -> Callable:
-            self.add_tool(func, name=name, description=description, annotations=annotations)
-            return func
-
-        return decorator
-
-    async def list_tools(self) -> list[Tool]:
-        """List all available tools with annotations."""
-        tools = list((await self._tool_manager.get_tools()).values())
-        return [
-            Tool(
-                name=info.name,
-                description=info.description,
-                inputSchema=info.parameters,
-                annotations=self._tool_annotations.get(info.name),
-            )
-            for info in tools
-        ]
-
-    def add_prompt(
-        self,
-        name: str,
-        description: str,
-        *,
-        arguments: list[PromptArgument] | None = None,
-        build_messages: Callable[[dict[str, str]], list[PromptMessage]],
-    ) -> None:
-        """Register a prompt template that can be listed and fetched."""
-        self._prompts[name] = PromptSpec(
-            description=description,
-            arguments=arguments,
-            build_messages=build_messages,
+mcp = FastMCP(
+    "Flight Search MCP Server",
+    icons=[
+        Icon(
+            src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48dGV4dCB5PSIuOWVtIiBmb250LXNpemU9IjkwIj7inIjvuI88L3RleHQ+PC9zdmc+",
+            mimeType="image/svg+xml",
         )
-
-    async def list_prompts(self) -> ListPromptsResult:
-        """Return all registered prompts."""
-        prompts = [
-            Prompt(
-                name=name,
-                description=spec.description,
-                arguments=spec.arguments,
-            )
-            for name, spec in self._prompts.items()
-        ]
-        return ListPromptsResult(prompts=prompts)
-
-    async def get_prompt(
-        self,
-        name: str,
-        arguments: dict[str, str] | None = None,
-    ) -> GetPromptResult:
-        """Generate prompt content by name."""
-        spec = self._prompts.get(name)
-        if not spec:
-            raise ValueError(f"Unknown prompt: {name}")
-        messages = spec.build_messages(arguments or {})
-        return GetPromptResult(description=spec.description, messages=messages)
-
-
-mcp = FliMCP("Flight Search MCP Server")
+    ],
+)
 
 
 # =============================================================================
@@ -212,8 +99,12 @@ mcp = FliMCP("Flight Search MCP Server")
 class FlightSearchParams(BaseModel):
     """Parameters for searching flights on a specific date."""
 
-    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK', 'LAX')")
-    destination: str = Field(description="Arrival airport IATA code (e.g., 'LHR', 'NRT')")
+    origin: str = Field(
+        description="Departure airport IATA code(s), comma-separated for multiple (e.g., 'JFK,LGA')"
+    )
+    destination: str = Field(
+        description="Arrival airport IATA code(s), comma-separated for multiple (e.g., 'LHR,CDG')"
+    )
     departure_date: str = Field(description="Outbound travel date in YYYY-MM-DD format")
     return_date: str | None = Field(
         None, description="Return date in YYYY-MM-DD format (omit for one-way)"
@@ -243,13 +134,64 @@ class FlightSearchParams(BaseModel):
     exclude_basic_economy: bool = Field(
         False, description="Exclude basic economy fares from results"
     )
+    emissions: str = Field("ALL", description="Filter by emissions level: ALL or LESS")
+    checked_bags: int = Field(
+        0, ge=0, le=2, description="Number of checked bags to include in price (0, 1, or 2)"
+    )
+    carry_on: bool = Field(False, description="Include carry-on bag fee in displayed price")
+    show_all_results: bool = Field(
+        True, description="Return all available results instead of curated ~30"
+    )
+    currency: str | None = Field(
+        None,
+        description=(
+            "ISO 4217 currency code (e.g. 'USD', 'EUR', 'GBP') to bill prices in. "
+            "When omitted, Google picks based on locale (usually USD)."
+        ),
+    )
+    language: str | None = Field(
+        None,
+        description="Optional BCP-47 language code (e.g. 'en-GB') passed to Google as `hl`.",
+    )
+    country: str | None = Field(
+        None,
+        description=(
+            "Optional ISO 3166-1 alpha-2 country code (e.g. 'GB') for Google's `gl` param."
+        ),
+    )
+    exclude_airlines: list[str] | None = Field(
+        None,
+        description="Airline IATA codes to EXCLUDE from results (e.g. ['DL', 'B6']).",
+    )
+    alliance: list[str] | None = Field(
+        None,
+        description=("Restrict to one or more alliances: 'ONEWORLD', 'SKYTEAM', 'STAR_ALLIANCE'."),
+    )
+    exclude_alliance: list[str] | None = Field(
+        None,
+        description="Alliance names to EXCLUDE from results.",
+    )
+    min_layover: int | None = Field(
+        None,
+        ge=1,
+        description="Minimum layover duration in minutes (multi-stop trips only).",
+    )
+    max_layover: int | None = Field(
+        None,
+        ge=1,
+        description="Maximum layover duration in minutes (multi-stop trips only).",
+    )
 
 
 class DateSearchParams(BaseModel):
     """Parameters for finding the cheapest travel dates within a range."""
 
-    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK', 'LAX')")
-    destination: str = Field(description="Arrival airport IATA code (e.g., 'LHR', 'NRT')")
+    origin: str = Field(
+        description="Departure airport IATA code(s), comma-separated for multiple (e.g., 'JFK,LGA')"
+    )
+    destination: str = Field(
+        description="Arrival airport IATA code(s), comma-separated for multiple (e.g., 'LHR,CDG')"
+    )
     start_date: str = Field(description="Start of date range in YYYY-MM-DD format")
     end_date: str = Field(description="End of date range in YYYY-MM-DD format")
     trip_duration: int = Field(
@@ -275,6 +217,45 @@ class DateSearchParams(BaseModel):
         ge=1,
         description="Number of adult passengers",
     )
+    currency: str | None = Field(
+        None,
+        description=(
+            "ISO 4217 currency code (e.g. 'USD', 'EUR', 'GBP') to bill prices in. "
+            "When omitted, Google picks based on locale (usually USD)."
+        ),
+    )
+    language: str | None = Field(
+        None,
+        description="Optional BCP-47 language code (e.g. 'en-GB') passed to Google as `hl`.",
+    )
+    country: str | None = Field(
+        None,
+        description=(
+            "Optional ISO 3166-1 alpha-2 country code (e.g. 'GB') for Google's `gl` param."
+        ),
+    )
+    exclude_airlines: list[str] | None = Field(
+        None,
+        description="Airline IATA codes to EXCLUDE from results.",
+    )
+    alliance: list[str] | None = Field(
+        None,
+        description="Restrict to alliances: 'ONEWORLD', 'SKYTEAM', 'STAR_ALLIANCE'.",
+    )
+    exclude_alliance: list[str] | None = Field(
+        None,
+        description="Alliance names to EXCLUDE from results.",
+    )
+    min_layover: int | None = Field(
+        None,
+        ge=1,
+        description="Minimum layover duration in minutes (multi-stop trips only).",
+    )
+    max_layover: int | None = Field(
+        None,
+        ge=1,
+        description="Maximum layover duration in minutes (multi-stop trips only).",
+    )
 
 
 # =============================================================================
@@ -282,26 +263,97 @@ class DateSearchParams(BaseModel):
 # =============================================================================
 
 
+def _airline_code(airline: Any) -> str:
+    return getattr(airline, "name", str(airline)).lstrip("_")
+
+
 def _serialize_flight_leg(leg: Any) -> dict[str, Any]:
     """Serialize a single flight leg to a dictionary."""
-    return {
+    out: dict[str, Any] = {
         "departure_airport": leg.departure_airport,
         "arrival_airport": leg.arrival_airport,
         "departure_time": leg.departure_datetime,
         "arrival_time": leg.arrival_datetime,
         "duration": leg.duration,
         "airline": leg.airline,
-        "airline_code": getattr(leg.airline, "name", leg.airline).lstrip("_"),
+        "airline_code": _airline_code(leg.airline),
         "flight_number": leg.flight_number,
     }
+    if getattr(leg, "departure_airport_name", None):
+        out["departure_airport_name"] = leg.departure_airport_name
+    if getattr(leg, "arrival_airport_name", None):
+        out["arrival_airport_name"] = leg.arrival_airport_name
+    if getattr(leg, "operating_airline", None):
+        out["operating_airline"] = _airline_code(leg.operating_airline)
+    if getattr(leg, "aircraft", None):
+        out["aircraft"] = leg.aircraft
+    if getattr(leg, "legroom", None):
+        out["legroom"] = leg.legroom
+    if getattr(leg, "overnight", False):
+        out["overnight"] = True
+    amenities = getattr(leg, "amenities", None)
+    if amenities is not None:
+        a = amenities.model_dump(exclude_none=True)
+        if a:
+            out["amenities"] = a
+    return out
+
+
+def _serialize_layover(layover: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "airport": _airline_code(layover.airport),
+        "duration": layover.duration,
+    }
+    if layover.overnight:
+        out["overnight"] = True
+    if layover.change_of_airport:
+        out["change_of_airport"] = True
+    return out
+
+
+def _flight_extras(flight: Any) -> dict[str, Any]:
+    """Surface optional rich fields when populated by the parser.
+
+    Emissions fields (``co2_emissions_g`` etc.) are deliberately omitted —
+    the ``--emissions LESS`` filter still flows through to Google, but
+    raw CO₂ numbers are not part of the tool's response shape.
+    """
+    out: dict[str, Any] = {}
+    for src, key in (
+        ("primary_airline_name", "primary_airline_name"),
+        ("self_transfer", "self_transfer"),
+        ("mixed_cabin", "mixed_cabin"),
+        ("booking_token", "booking_token"),
+    ):
+        v = getattr(flight, src, None)
+        if v is not None and v != "":
+            out[key] = v
+    primary = getattr(flight, "primary_airline", None)
+    if primary is not None:
+        out["primary_airline"] = _airline_code(primary)
+    layovers = getattr(flight, "layovers", None)
+    if layovers:
+        out["layovers"] = [_serialize_layover(lo) for lo in layovers]
+    return out
 
 
 def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[str, Any]:
-    """Serialize a flight result (or round-trip pair) to a dictionary."""
-    if is_round_trip and isinstance(flight, tuple):
-        outbound, return_flight = flight
-        return {
-            # Google Flights returns the full round-trip price on the outbound leg
+    """Serialize a flight result (or round-trip/multi-city tuple) to a dictionary."""
+    if not isinstance(flight, tuple):
+        out = {
+            "price": flight.price,
+            "currency": flight.currency or CONFIG.default_currency,
+            "legs": [_serialize_flight_leg(leg) for leg in flight.legs],
+        }
+        out.update(_flight_extras(flight))
+        return out
+
+    segments = list(flight)
+
+    if len(segments) == 2 and is_round_trip:
+        # Google Flights returns the full round-trip price on the outbound leg
+        outbound, return_flight = segments
+        out = {
             "price": outbound.price,
             "currency": outbound.currency or CONFIG.default_currency,
             "legs": [
@@ -309,12 +361,22 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
                 *[_serialize_flight_leg(leg) for leg in return_flight.legs],
             ],
         }
-    else:
-        return {
-            "price": flight.price,
-            "currency": flight.currency or CONFIG.default_currency,
-            "legs": [_serialize_flight_leg(leg) for leg in flight.legs],
-        }
+        out.update(_flight_extras(outbound))
+        return_extras = _flight_extras(return_flight)
+        if return_extras:
+            out["return_flight"] = return_extras
+        return out
+
+    # Multi-city (3+ legs) or 2-leg non-round-trip: combined price on the
+    # final leg (matches Google Flights pricing and the CLI display logic).
+    price_segment = segments[-1] if len(segments) > 2 else segments[0]
+    out = {
+        "price": price_segment.price,
+        "currency": price_segment.currency or CONFIG.default_currency,
+        "legs": [_serialize_flight_leg(leg) for segment in segments for leg in segment.legs],
+    }
+    out.update(_flight_extras(price_segment))
+    return out
 
 
 def _serialize_date_result(date_result: Any) -> dict[str, Any]:
@@ -332,29 +394,55 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
 # =============================================================================
 
 
+def _resolve_airports(codes: str) -> list[Airport]:
+    """Resolve one or more comma-separated airport codes."""
+    airports = [resolve_airport(code.strip()) for code in codes.split(",") if code.strip()]
+    if not airports:
+        raise ParseError(f"No valid airport codes found in: '{codes}'")
+    return airports
+
+
 def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
     """Execute a flight search and return formatted results."""
     try:
-        # Parse inputs using shared utilities
-        origin = resolve_airport(params.origin)
-        destination = resolve_airport(params.destination)
+        # Parse inputs using shared utilities (supports comma-separated multi-airport)
+        origins = _resolve_airports(params.origin)
+        destinations = _resolve_airports(params.destination)
         cabin_class = parse_cabin_class(params.cabin_class)
         max_stops = parse_max_stops(params.max_stops)
         sort_by = parse_sort_by(params.sort_by)
         airlines = parse_airlines(params.airlines)
+        airlines_exclude = parse_airlines(params.exclude_airlines)
+        alliances = parse_alliances(params.alliance)
+        alliances_exclude = parse_alliances(params.exclude_alliance)
 
         # Build time restrictions
         departure_window = params.departure_window or CONFIG.default_departure_window
         time_restrictions = build_time_restrictions(departure_window) if departure_window else None
 
-        # Build flight segments
+        # Build flight segments (pass full lists for multi-airport support)
         segments, trip_type = build_flight_segments(
-            origin=origin,
-            destination=destination,
+            origin=origins,
+            destination=destinations,
             departure_date=params.departure_date,
             return_date=params.return_date,
             time_restrictions=time_restrictions,
         )
+
+        # Parse new filters
+        emissions_filter = parse_emissions(params.emissions)
+        bags_filter = None
+        if params.checked_bags > 0 or params.carry_on:
+            bags_filter = BagsFilter(checked_bags=params.checked_bags, carry_on=params.carry_on)
+
+        layover_restrictions = None
+        if params.min_layover is not None or params.max_layover is not None:
+            from fli.models import LayoverRestrictions
+
+            layover_restrictions = LayoverRestrictions(
+                min_duration=params.min_layover,
+                max_duration=params.max_layover,
+            )
 
         # Create search filters
         filters = FlightSearchFilters(
@@ -364,13 +452,26 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
             stops=max_stops,
             seat_type=cabin_class,
             airlines=airlines,
+            airlines_exclude=airlines_exclude,
+            alliances=alliances,
+            alliances_exclude=alliances_exclude,
+            layover_restrictions=layover_restrictions,
             sort_by=sort_by,
             exclude_basic_economy=params.exclude_basic_economy,
+            emissions=emissions_filter,
+            bags=bags_filter,
+            show_all_results=params.show_all_results,
         )
 
         # Perform search
+        currency = parse_currency(params.currency)
         search_client = SearchFlights()
-        flights = search_client.search(filters)
+        flights = search_client.search(
+            filters,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
 
         if not flights:
             return {"success": True, "flights": [], "count": 0, "trip_type": trip_type.name}
@@ -401,26 +502,38 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
 def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
     """Execute a date search and return formatted results."""
     try:
-        # Parse inputs using shared utilities
-        origin = resolve_airport(params.origin)
-        destination = resolve_airport(params.destination)
+        # Parse inputs using shared utilities (supports comma-separated multi-airport)
+        origins = _resolve_airports(params.origin)
+        destinations = _resolve_airports(params.destination)
         cabin_class = parse_cabin_class(params.cabin_class)
         max_stops = parse_max_stops(params.max_stops)
         airlines = parse_airlines(params.airlines)
+        airlines_exclude = parse_airlines(params.exclude_airlines)
+        alliances = parse_alliances(params.alliance)
+        alliances_exclude = parse_alliances(params.exclude_alliance)
 
         # Build time restrictions
         departure_window = params.departure_window or CONFIG.default_departure_window
         time_restrictions = build_time_restrictions(departure_window) if departure_window else None
 
-        # Build flight segments
+        # Build flight segments (pass full lists for multi-airport support)
         segments, trip_type = build_date_search_segments(
-            origin=origin,
-            destination=destination,
+            origin=origins,
+            destination=destinations,
             start_date=params.start_date,
             trip_duration=params.trip_duration,
             is_round_trip=params.is_round_trip,
             time_restrictions=time_restrictions,
         )
+
+        layover_restrictions = None
+        if params.min_layover is not None or params.max_layover is not None:
+            from fli.models import LayoverRestrictions
+
+            layover_restrictions = LayoverRestrictions(
+                min_duration=params.min_layover,
+                max_duration=params.max_layover,
+            )
 
         # Create search filters
         filters = DateSearchFilters(
@@ -430,14 +543,24 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
             stops=max_stops,
             seat_type=cabin_class,
             airlines=airlines,
+            airlines_exclude=airlines_exclude,
+            alliances=alliances,
+            alliances_exclude=alliances_exclude,
+            layover_restrictions=layover_restrictions,
             from_date=params.start_date,
             to_date=params.end_date,
             duration=params.trip_duration if params.is_round_trip else None,
         )
 
         # Perform search
+        currency = parse_currency(params.currency)
         search_client = SearchDates()
-        dates = search_client.search(filters)
+        dates = search_client.search(
+            filters,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
 
         if not dates:
             return {
@@ -485,8 +608,20 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
     },
 )
 def search_flights(
-    origin: Annotated[str, Field(description="Departure airport IATA code (e.g., 'JFK')")],
-    destination: Annotated[str, Field(description="Arrival airport IATA code (e.g., 'LHR')")],
+    origin: Annotated[
+        str,
+        Field(
+            description="Departure airport IATA code(s), comma-separated for multiple "
+            "(e.g., 'JFK' or 'JFK,LGA')"
+        ),
+    ],
+    destination: Annotated[
+        str,
+        Field(
+            description="Arrival airport IATA code(s), comma-separated for multiple "
+            "(e.g., 'LHR' or 'LHR,CDG')"
+        ),
+    ],
     departure_date: Annotated[str, Field(description="Travel date in YYYY-MM-DD format")],
     return_date: Annotated[
         str | None,
@@ -510,7 +645,10 @@ def search_flights(
     ] = "ANY",
     sort_by: Annotated[
         str,
-        Field(description="Sort by: CHEAPEST, DURATION, DEPARTURE_TIME, ARRIVAL_TIME"),
+        Field(
+            description="Sort by: TOP_FLIGHTS, BEST, CHEAPEST,"
+            " DEPARTURE_TIME, ARRIVAL_TIME, DURATION, EMISSIONS"
+        ),
     ] = CONFIG.default_sort_by,
     passengers: Annotated[
         int | None,
@@ -520,6 +658,59 @@ def search_flights(
         bool,
         Field(description="Exclude basic economy fares from results"),
     ] = False,
+    emissions: Annotated[
+        str,
+        Field(description="Filter by emissions level: ALL or LESS"),
+    ] = "ALL",
+    checked_bags: Annotated[
+        int,
+        Field(description="Number of checked bags to include in price (0, 1, or 2)", ge=0, le=2),
+    ] = 0,
+    carry_on: Annotated[
+        bool,
+        Field(description="Include carry-on bag fee in displayed price"),
+    ] = False,
+    show_all_results: Annotated[
+        bool,
+        Field(description="Return all available results instead of curated ~30"),
+    ] = True,
+    currency: Annotated[
+        str | None,
+        Field(
+            description=(
+                "ISO 4217 currency code (USD, EUR, GBP, JPY...) for prices. "
+                "When omitted, Google picks based on locale."
+            )
+        ),
+    ] = None,
+    language: Annotated[
+        str | None,
+        Field(description="Optional BCP-47 language code (e.g., 'en-GB') for the `hl` URL param."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        Field(description="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB')."),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes to EXCLUDE from results."),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        Field(description="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE."),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        Field(description="Alliance names to EXCLUDE from results."),
+    ] = None,
+    min_layover: Annotated[
+        int | None,
+        Field(description="Minimum layover duration in minutes.", ge=1),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        Field(description="Maximum layover duration in minutes.", ge=1),
+    ] = None,
 ) -> dict[str, Any]:
     """Search for flights between two airports on a specific date.
 
@@ -539,16 +730,25 @@ def search_flights(
         sort_by=sort_by,
         passengers=passengers or CONFIG.default_passengers,
         exclude_basic_economy=exclude_basic_economy,
+        emissions=emissions,
+        checked_bags=checked_bags,
+        carry_on=carry_on,
+        show_all_results=show_all_results,
+        currency=currency,
+        language=language,
+        country=country,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        min_layover=min_layover,
+        max_layover=max_layover,
     )
     return _execute_flight_search(params)
 
 
 def _search_flights_from_params(params: FlightSearchParams) -> dict[str, Any]:
-    """Compatibility wrapper for tests expecting the params-based signature."""
+    """Entry point for tests that call the tool via a params object."""
     return _execute_flight_search(params)
-
-
-search_flights.fn = _search_flights_from_params  # type: ignore[attr-defined]
 
 
 @mcp.tool(
@@ -559,8 +759,20 @@ search_flights.fn = _search_flights_from_params  # type: ignore[attr-defined]
     },
 )
 def search_dates(
-    origin: Annotated[str, Field(description="Departure airport IATA code (e.g., 'JFK')")],
-    destination: Annotated[str, Field(description="Arrival airport IATA code (e.g., 'LHR')")],
+    origin: Annotated[
+        str,
+        Field(
+            description="Departure airport IATA code(s), comma-separated for multiple "
+            "(e.g., 'JFK' or 'JFK,LGA')"
+        ),
+    ],
+    destination: Annotated[
+        str,
+        Field(
+            description="Arrival airport IATA code(s), comma-separated for multiple "
+            "(e.g., 'LHR' or 'LHR,CDG')"
+        ),
+    ],
     start_date: Annotated[str, Field(description="Start of date range in YYYY-MM-DD format")],
     end_date: Annotated[str, Field(description="End of date range in YYYY-MM-DD format")],
     trip_duration: Annotated[
@@ -595,6 +807,38 @@ def search_dates(
         int | None,
         Field(description="Number of adult passengers", ge=1),
     ] = None,
+    currency: Annotated[
+        str | None,
+        Field(description="ISO 4217 currency code (USD, EUR, GBP, JPY...) for prices."),
+    ] = None,
+    language: Annotated[
+        str | None,
+        Field(description="Optional BCP-47 language code (e.g., 'en-GB') for the `hl` URL param."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        Field(description="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB')."),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes to EXCLUDE from results."),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        Field(description="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE."),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        Field(description="Alliance names to EXCLUDE from results."),
+    ] = None,
+    min_layover: Annotated[
+        int | None,
+        Field(description="Minimum layover duration in minutes.", ge=1),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        Field(description="Maximum layover duration in minutes.", ge=1),
+    ] = None,
 ) -> dict[str, Any]:
     """Find the cheapest travel dates between two airports within a date range.
 
@@ -615,16 +859,69 @@ def search_dates(
         departure_window=effective_departure_window,
         sort_by_price=sort_by_price,
         passengers=passengers or CONFIG.default_passengers,
+        currency=currency,
+        language=language,
+        country=country,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        min_layover=min_layover,
+        max_layover=max_layover,
     )
     return _execute_date_search(params)
 
 
 def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
-    """Compatibility wrapper for tests expecting the params-based signature."""
+    """Entry point for tests that call the tool via a params object."""
     return _execute_date_search(params)
 
 
-search_dates.fn = _search_dates_from_params  # type: ignore[attr-defined]
+def _find_airports_impl(query: str, limit: int = 10) -> dict[str, Any]:
+    """Run search_airports and shape the result into the MCP response dict."""
+    try:
+        results = search_airports(query, limit=limit)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "query": query,
+        }
+
+    return {
+        "success": True,
+        "query": query,
+        "count": len(results),
+        "airports": [
+            {"code": r.code.name, "name": r.name, "match_type": r.match_type} for r in results
+        ],
+    }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Airports",
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
+)
+def find_airports(
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "City name, airport name, or IATA code (e.g., 'new york', 'heathrow', 'JFK')"
+            )
+        ),
+    ],
+    limit: Annotated[int, Field(description="Maximum results to return", ge=1, le=50)] = 10,
+) -> dict[str, Any]:
+    """Search for airports by city name, airport name, or IATA code.
+
+    Use this tool to find airport IATA codes before searching for flights.
+    Supports city names (e.g., "new york" returns JFK, LGA, EWR),
+    airport names (e.g., "heathrow" returns LHR), and IATA codes.
+    """
+    return _find_airports_impl(query, limit=limit)
 
 
 # =============================================================================
@@ -632,103 +929,49 @@ search_dates.fn = _search_dates_from_params  # type: ignore[attr-defined]
 # =============================================================================
 
 
-def _build_search_prompt(args: dict[str, str]) -> list[PromptMessage]:
-    """Create a helper prompt to guide flight searches."""
-    origin = args.get("origin", "JFK").upper()
-    destination = args.get("destination", "LHR").upper()
-    date = args.get("date") or datetime.now(timezone.utc).date().isoformat()
-    prefer_non_stop = args.get("prefer_non_stop", "true").lower()
-    max_stops_hint = "NON_STOP" if prefer_non_stop in {"true", "1", "yes"} else "ANY"
-    text = (
-        "Use the `search_flights` tool to look for flights from "
-        f"{origin} to {destination} departing on {date}. "
-        f"Set `max_stops` to '{max_stops_hint}' and highlight the three most affordable options."
-    )
-    return [
-        PromptMessage(role="user", content=TextContent(type="text", text=text)),
-    ]
-
-
-def _build_budget_prompt(args: dict[str, str]) -> list[PromptMessage]:
-    """Create a helper prompt to guide flexible date searches."""
-    origin = args.get("origin", "SFO").upper()
-    destination = args.get("destination", "NRT").upper()
-    today = datetime.now(timezone.utc).date()
-    start_date = args.get("start_date") or (today + timedelta(days=30)).isoformat()
-    end_date = args.get("end_date") or (today + timedelta(days=90)).isoformat()
-    duration = args.get("duration", "7")
-    text = (
-        "Use the `search_dates` tool to find the lowest fares between "
-        f"{origin} and {destination} for trips between {start_date} and {end_date}. "
-        f"Set trip_duration to {duration} days and sort the results by price."
-    )
-    return [
-        PromptMessage(role="user", content=TextContent(type="text", text=text)),
-    ]
-
-
-mcp.add_prompt(
+@mcp.prompt(
     name="search-direct-flight",
     description=(
         "Generate a tool call to find direct flights between two airports on a target date."
     ),
-    arguments=[
-        PromptArgument(
-            name="origin",
-            description="Departure airport IATA code",
-            required=True,
-        ),
-        PromptArgument(
-            name="destination",
-            description="Arrival airport IATA code",
-            required=True,
-        ),
-        PromptArgument(
-            name="date",
-            description="Departure date (YYYY-MM-DD)",
-            required=False,
-        ),
-        PromptArgument(
-            name="prefer_non_stop",
-            description="Set to true to prefer nonstop itineraries",
-            required=False,
-        ),
-    ],
-    build_messages=_build_search_prompt,
 )
+def search_direct_flight_prompt(
+    origin: str,
+    destination: str,
+    date: str | None = None,
+    prefer_non_stop: bool = True,
+) -> str:
+    """Create a helper prompt to guide flight searches."""
+    travel_date = date or datetime.now(timezone.utc).date().isoformat()
+    max_stops_hint = "NON_STOP" if prefer_non_stop else "ANY"
+    return (
+        "Use the `search_flights` tool to look for flights from "
+        f"{origin.upper()} to {destination.upper()} departing on {travel_date}. "
+        f"Set `max_stops` to '{max_stops_hint}' and highlight the three most affordable options."
+    )
 
-mcp.add_prompt(
+
+@mcp.prompt(
     name="find-budget-window",
-    description=("Suggest the cheapest travel dates for a route within a flexible window."),
-    arguments=[
-        PromptArgument(
-            name="origin",
-            description="Departure airport IATA code",
-            required=True,
-        ),
-        PromptArgument(
-            name="destination",
-            description="Arrival airport IATA code",
-            required=True,
-        ),
-        PromptArgument(
-            name="start_date",
-            description="Start of the travel window (YYYY-MM-DD)",
-            required=False,
-        ),
-        PromptArgument(
-            name="end_date",
-            description="End of the travel window (YYYY-MM-DD)",
-            required=False,
-        ),
-        PromptArgument(
-            name="duration",
-            description="Desired trip length in days",
-            required=False,
-        ),
-    ],
-    build_messages=_build_budget_prompt,
+    description="Suggest the cheapest travel dates for a route within a flexible window.",
 )
+def find_budget_window_prompt(
+    origin: str,
+    destination: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    duration: int = 7,
+) -> str:
+    """Create a helper prompt to guide flexible date searches."""
+    today = datetime.now(timezone.utc).date()
+    travel_start = start_date or (today + timedelta(days=30)).isoformat()
+    travel_end = end_date or (today + timedelta(days=90)).isoformat()
+    return (
+        "Use the `search_dates` tool to find the lowest fares between "
+        f"{origin.upper()} and {destination.upper()} for trips between "
+        f"{travel_start} and {travel_end}. "
+        f"Set trip_duration to {duration} days and sort the results by price."
+    )
 
 
 # =============================================================================
@@ -775,8 +1018,14 @@ def run():
     mcp.run(transport="stdio")
 
 
-def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Run the MCP server over HTTP (streamable)."""
+def run_http(host: str = "0.0.0.0", port: int = 8000) -> None:
+    """Run the MCP server over HTTP (streamable).
+
+    The default host is ``0.0.0.0`` so the server is reachable from outside the
+    container when deployed (e.g. Railway, Docker). When running locally this
+    exposes the server on every network interface — set ``HOST=127.0.0.1`` to
+    restrict it to loopback.
+    """
     env_host = os.getenv("HOST")
     env_port = os.getenv("PORT")
 

@@ -37,12 +37,22 @@ fli flights JFK LHR 2026-06-01 --return 2026-06-15
 ```bash
 fli flights JFK LHR 2026-06-01 \
     --time 6-20 \             # Departure window (6 AM - 8 PM)
-    --airlines BA KL \        # Airlines (British Airways, KLM)
+    --airlines BA,KL \        # Airlines (British Airways, KLM)
     --class BUSINESS \        # Cabin class
     --stops NON_STOP          # Non-stop flights only
 ```
 
-4. Find cheapest dates:
+4. Search with alliance / exclusion / locale filters:
+
+```bash
+fli flights JFK LHR 2026-06-01 \
+    --alliance ONEWORLD \           # Limit to Oneworld members
+    --exclude-airlines AA \         # …but skip American
+    --min-layover 90 --max-layover 360 \
+    --currency EUR --language en-GB --country GB
+```
+
+6. Find cheapest dates:
 
 ```bash
 fli dates JFK LHR --from 2026-06-01 --to 2026-06-30
@@ -52,7 +62,7 @@ fli dates JFK LHR --from 2026-06-01 --to 2026-06-30
     `--format json` is experimental.
     The JSON schema is intended for agents and tools such as `jq`, but it may evolve in future releases.
 
-5. Return machine-readable JSON:
+7. Return machine-readable JSON:
 
 ```bash
 fli flights JFK LHR 2026-06-01 --format json

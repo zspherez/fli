@@ -6,6 +6,7 @@ from typing import Annotated
 import typer
 
 from fli.cli.enums import DayOfWeek, OutputFormat
+from fli.cli.errors import json_error_payload, report_cli_error
 from fli.cli.utils import (
     build_json_error_response,
     build_json_success_response,
@@ -15,10 +16,12 @@ from fli.cli.utils import (
     normalize_cli_date,
     normalize_cli_time_range,
     serialize_date_result,
+    validate_currency,
 )
 from fli.core import (
     build_date_search_segments,
     parse_airlines,
+    parse_alliances,
     parse_cabin_class,
     parse_max_stops,
     resolve_airport,
@@ -30,7 +33,7 @@ from fli.models import (
     TimeRestrictions,
     TripType,
 )
-from fli.search import SearchDates
+from fli.search import SearchClientError, SearchDates
 
 
 def _build_selected_days(
@@ -85,7 +88,7 @@ def dates(
         typer.Option(
             "--airlines",
             "-a",
-            help="List of airline IATA codes (e.g., BA KL)",
+            help="Airline IATA codes (e.g., BA,KL or repeated --airlines BA --airlines KL)",
         ),
     ] = None,
     is_round_trip: Annotated[
@@ -191,11 +194,73 @@ def dates(
             case_sensitive=False,
         ),
     ] = OutputFormat.TEXT,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            callback=validate_currency,
+            help="Currency code (USD, EUR, GBP, JPY...). Passed to Google as `curr=`.",
+        ),
+    ] = "USD",
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Optional BCP-47 language code (e.g., 'en-GB') passed to Google as `hl=`.",
+        ),
+    ] = None,
+    country: Annotated[
+        str | None,
+        typer.Option(
+            "--country",
+            help="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB') passed to Google as `gl=`.",
+        ),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-airlines",
+            "-A",
+            help="Airline IATA codes to EXCLUDE from results.",
+        ),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--alliance",
+            help="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE.",
+        ),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-alliance",
+            help="Alliance names to EXCLUDE (ONEWORLD, SKYTEAM, STAR_ALLIANCE).",
+        ),
+    ] = None,
+    min_layover: Annotated[
+        int | None,
+        typer.Option(
+            "--min-layover",
+            help="Minimum layover duration in minutes (multi-stop trips only).",
+            min=1,
+        ),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        typer.Option(
+            "--max-layover",
+            help="Maximum layover duration in minutes (multi-stop trips only).",
+            min=1,
+        ),
+    ] = None,
 ):
     """Find the cheapest dates to fly between two airports.
 
     Example:
         fli dates LAX MIA --class BUSINESS --stops NON_STOP --friday
+        fli dates LAX MIA --alliance ONEWORLD --currency EUR
+        fli dates LAX MIA --exclude-airlines DL --max-layover 240
 
     """
     try:
@@ -210,6 +275,9 @@ def dates(
         stops = parse_max_stops(max_stops)
         seat_type = parse_cabin_class(cabin_class)
         parsed_airlines = parse_airlines(airlines)
+        parsed_exclude_airlines = parse_airlines(exclude_airlines)
+        parsed_alliances = parse_alliances(alliance)
+        parsed_exclude_alliances = parse_alliances(exclude_alliance)
         selected_days = _build_selected_days(
             monday=monday,
             tuesday=tuesday,
@@ -231,7 +299,11 @@ def dates(
             "departure_window": (
                 f"{departure_window[0]}-{departure_window[1]}" if departure_window else None
             ),
-            "airlines": [airline.name for airline in parsed_airlines] if parsed_airlines else None,
+            "airlines": (
+                [airline.name.lstrip("_") for airline in parsed_airlines]
+                if parsed_airlines
+                else None
+            ),
             "sort_by_price": sort_by_price,
             "days": [day.value for day in selected_days],
         }
@@ -257,6 +329,17 @@ def dates(
             time_restrictions=time_restrictions,
         )
 
+        # Build layover constraints (min / max duration; airports stay
+        # restricted via the existing model field).
+        layover_restrictions = None
+        if min_layover is not None or max_layover is not None:
+            from fli.models import LayoverRestrictions
+
+            layover_restrictions = LayoverRestrictions(
+                min_duration=min_layover,
+                max_duration=max_layover,
+            )
+
         # Create search filters
         filters = DateSearchFilters(
             trip_type=trip_type,
@@ -265,14 +348,23 @@ def dates(
             stops=stops,
             seat_type=seat_type,
             airlines=parsed_airlines,
+            airlines_exclude=parsed_exclude_airlines,
+            alliances=parsed_alliances,
+            alliances_exclude=parsed_exclude_alliances,
+            layover_restrictions=layover_restrictions,
             from_date=start_date,
             to_date=end_date,
             duration=trip_duration if trip_type == TripType.ROUND_TRIP else None,
         )
 
-        # Perform search
+        # Perform search; pass currency/language/country through as URL params.
         search_client = SearchDates()
-        results = search_client.search(filters)
+        results = search_client.search(
+            filters,
+            currency=currency,
+            language=language,
+            country=country,
+        )
 
         if not results:
             results = []
@@ -291,7 +383,10 @@ def dates(
                     trip_type=trip_type,
                     query=query,
                     results_key="dates",
-                    results=[serialize_date_result(result, trip_type) for result in results],
+                    results=[
+                        serialize_date_result(result, trip_type, default_currency=currency)
+                        for result in results
+                    ],
                 )
             )
             return
@@ -305,7 +400,7 @@ def dates(
             typer.echo(message)
             raise typer.Exit(1)
 
-        display_date_results(results, trip_type)
+        display_date_results(results, trip_type, default_currency=currency)
 
     except ParseError as e:
         if output_format == OutputFormat.JSON:
@@ -347,6 +442,18 @@ def dates(
             raise typer.Exit(1) from e
         typer.echo(f"Error: {str(e)}")
         raise typer.Exit(1) from e
+    except SearchClientError as e:
+        if output_format == OutputFormat.JSON:
+            message, error_type, log_path = json_error_payload(e, command="dates")
+            payload = build_json_error_response(
+                search_type="dates",
+                message=message,
+                error_type=error_type,
+            )
+            payload["error"]["log_path"] = str(log_path)
+            emit_json(payload)
+            raise typer.Exit(1) from e
+        raise report_cli_error(e, command="dates") from e
     except (AttributeError, ValueError) as e:
         if "module 'fli.search' has no attribute 'SearchDates'" in str(e):
             raise
@@ -390,3 +497,15 @@ def dates(
             raise typer.Exit(1) from e
         typer.echo(f"Error: {str(e)}")
         raise typer.Exit(1) from e
+    except Exception as e:  # noqa: BLE001 — fall back to clean reporting
+        if output_format == OutputFormat.JSON:
+            message, error_type, log_path = json_error_payload(e, command="dates")
+            payload = build_json_error_response(
+                search_type="dates",
+                message=message,
+                error_type=error_type,
+            )
+            payload["error"]["log_path"] = str(log_path)
+            emit_json(payload)
+            raise typer.Exit(1) from e
+        raise report_cli_error(e, command="dates") from e

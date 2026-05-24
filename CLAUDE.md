@@ -109,12 +109,15 @@ uv run mkdocs build         # Build static docs
 Search for flights on a specific date.
 
 **Key Parameters:**
-- `origin` / `destination` - Airport IATA codes
+- `origin` / `destination` - Airport IATA codes (comma-separated for multi-airport)
 - `departure_date` / `return_date` - Dates in YYYY-MM-DD format
 - `cabin_class` - ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST
 - `max_stops` - ANY, NON_STOP, ONE_STOP, TWO_PLUS_STOPS
 - `departure_window` - Time range in 'HH-HH' format
-- `airlines` - List of airline IATA codes
+- `airlines` / `exclude_airlines` - Include / exclude airline IATA codes
+- `alliance` / `exclude_alliance` - Include / exclude ONEWORLD / SKYTEAM / STAR_ALLIANCE
+- `min_layover` / `max_layover` - Layover duration bounds in minutes
+- `currency` / `language` / `country` - Google `curr=` / `hl=` / `gl=` URL params
 - `sort_by` - CHEAPEST, DURATION, DEPARTURE_TIME, ARRIVAL_TIME
 
 ### `search_dates`
@@ -126,7 +129,41 @@ Find cheapest travel dates within a range.
 - `trip_duration` - Number of days for round trips
 - `is_round_trip` - Boolean for round-trip search
 - `cabin_class`, `max_stops`, `departure_window`, `airlines` - Same as above
+- `exclude_airlines`, `alliance`, `exclude_alliance`, `min_layover`, `max_layover` - Same as `search_flights`
+- `currency`, `language`, `country` - Same locale knobs as `search_flights`
 - `sort_by_price` - Boolean to sort by price
+
+### Note on emissions
+Both tools accept the `emissions` filter (forwarded to Google's
+"less emissions" toggle as `LESS`), but raw CO₂ figures are intentionally
+**not** returned in CLI output or MCP tool responses. The filter operates
+server-side; the data is not displayed in the current release.
+
+## Releasing
+
+The Python (`flights` on PyPI) and JavaScript (`fli-js` on npm) packages
+are versioned and released **independently**, but with the same shape:
+manual `workflow_dispatch` → bump → tag → GitHub Release → publish.
+
+**PyPI** is cut via `.github/workflows/release.yml`
+(Actions → Release → Run workflow on `main`). Choose
+`bump=patch|minor|major|explicit`; the workflow bumps `pyproject.toml`,
+refreshes `uv.lock`, commits + tags `vX.Y.Z` + creates a GitHub Release,
+then calls `publish.yml` to upload to PyPI via Trusted Publishing.
+
+**npm** is cut via `.github/workflows/release-npm.yml`
+(Actions → Release npm → Run workflow on `main`). Same bump options;
+the workflow bumps `fli-js/package.json`, refreshes `fli-js/bun.lock`,
+commits + tags `fli-js-vX.Y.Z` + creates a GitHub Release, then calls
+`publish-npm.yml` to build (`tsc -p tsconfig.build.json`) and upload to
+npm with `--provenance` (uses the `NPM_TOKEN` secret).
+
+Always run with `dry_run=true` first to preview the version and release
+notes. The version-bump logic lives in `scripts/bump_version.py` (covered
+by `tests/scripts/test_bump_version.py`); the same script handles both
+`pyproject.toml` (via `--pyproject`) and `package.json` (via
+`--package-json`), and the tag prefix is controlled by `--tag-prefix`.
+Full process: `docs/guides/release.md` (PyPI), `docs/guides/release-npm.md` (npm).
 
 ## Code Style and Standards
 
